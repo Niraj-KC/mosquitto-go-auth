@@ -27,6 +27,7 @@ type Mongo struct {
 	AuthSource         string
 	UsersCollection    string
 	AclsCollection     string
+	URI                string // Added for Atlas support
 	Conn               *mongo.Client
 	disableSuperuser   bool
 	hasher             hashing.HashComparer
@@ -57,6 +58,7 @@ func NewMongo(authOpts map[string]string, logLevel log.Level, hasher hashing.Has
 		Password:           "",
 		DBName:             "mosquitto",
 		AuthSource:         "",
+		URI:                "", // Initialize URI field
 		UsersCollection:    "users",
 		AclsCollection:     "acls",
 		hasher:             hasher,
@@ -66,6 +68,11 @@ func NewMongo(authOpts map[string]string, logLevel log.Level, hasher hashing.Has
 
 	if authOpts["mongo_disable_superuser"] == "true" {
 		m.disableSuperuser = true
+	}
+
+	// Check for MongoDB URI (Atlas connection string) first
+	if mongoURI, ok := authOpts["mongo_uri"]; ok {
+		m.URI = mongoURI
 	}
 
 	if mongoHost, ok := authOpts["mongo_host"]; ok {
@@ -108,43 +115,77 @@ func NewMongo(authOpts map[string]string, logLevel log.Level, hasher hashing.Has
 		m.insecureSkipVerify = true
 	}
 
-	addr := fmt.Sprintf("mongodb://%s:%s", m.Host, m.Port)
-
+	// Create client options based on configuration
 	to := 60 * time.Second
-
 	opts := options.ClientOptions{
 		ConnectTimeout: &to,
 	}
 
+	// Configure TLS if needed
 	if m.withTLS {
-		opts.TLSConfig = &tls.Config{}
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: m.insecureSkipVerify,
+		}
+		opts.TLSConfig = tlsConfig
 	}
 
-	opts.ApplyURI(addr)
-
-	if m.Username != "" && m.Password != "" {
-		opts.Auth = &options.Credential{
-			AuthSource:  m.DBName,
-			Username:    m.Username,
-			Password:    m.Password,
-			PasswordSet: true,
+	// If URI is provided (Atlas connection), use it directly
+		if m.URI != "" {
+			log.Infof("mongo backend: using provided MongoDB URI %s", m.URI)
+			opts.ApplyURI(m.URI)
+			
+		// If credentials are provided separately, add them to the options
+		if m.Username != "" && m.Password != "" {
+			opts.Auth = &options.Credential{
+				Username:    m.Username,
+				Password:    m.Password,
+				PasswordSet: true,
+			}
+			
+			// Set AuthSource if provided
+			if m.AuthSource != "" {
+				opts.Auth.AuthSource = m.AuthSource
+			} else {
+				opts.Auth.AuthSource = m.DBName
+			}
 		}
-		// Set custom AuthSource db if supplied in config
-		if m.AuthSource != "" {
-			opts.Auth.AuthSource = m.AuthSource
-			log.Infof("mongo backend: set authentication db to: %s", m.AuthSource)
+	} else {
+		// Standard MongoDB connection without SRV
+		addr := fmt.Sprintf("mongodb://%s:%s", m.Host, m.Port)
+		opts.ApplyURI(addr)
+
+		if m.Username != "" && m.Password != "" {
+			opts.Auth = &options.Credential{
+				AuthSource:  m.DBName,
+				Username:    m.Username,
+				Password:    m.Password,
+				PasswordSet: true,
+			}
+			// Set custom AuthSource db if supplied in config
+			if m.AuthSource != "" {
+				opts.Auth.AuthSource = m.AuthSource
+				log.Infof("mongo backend: set authentication db to: %s", m.AuthSource)
+			}
 		}
 	}
 
+	// Connect to MongoDB
 	client, err := mongo.Connect(context.TODO(), &opts)
 	if err != nil {
 		return m, errors.Errorf("couldn't start mongo backend: %s", err)
 	}
 
+	// Verify the connection
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = client.Ping(ctx, nil)
+	if err != nil {
+		return m, errors.Errorf("mongo connection failed: %s", err)
+	}
+
 	m.Conn = client
 
 	return m, nil
-
 }
 
 //GetUser checks that the username exists and the given password hashes to the same password.
